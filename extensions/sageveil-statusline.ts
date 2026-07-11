@@ -1,0 +1,217 @@
+import {
+  createLocalBashOperations,
+  type ExtensionAPI,
+} from '@earendil-works/pi-coding-agent';
+import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { basename } from 'node:path';
+
+const piIcon =
+  '\x1b[38;2;16;19;16;48;2;135;111;127m π \x1b[49;38;2;135;111;127m\x1b[39m';
+const formatTokens = (tokens: number) => {
+  if (tokens < 1000) return tokens.toString();
+  if (tokens < 10_000) return `${(tokens / 1000).toFixed(1)}k`;
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1000)}k`;
+  if (tokens < 10_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(tokens / 1_000_000)}M`;
+};
+
+const emptyGitStatus = () => ({
+  untracked: 0,
+  modified: 0,
+  renamed: 0,
+  deleted: 0,
+  staged: 0,
+  stashed: 0,
+  ahead: 0,
+  behind: 0,
+});
+
+const parseGitStatus = (output: string) => {
+  const status = emptyGitStatus();
+
+  for (const line of output.split('\n')) {
+    if (line.startsWith('# branch.ab ')) {
+      const match = line.match(/\+(\d+) -(\d+)/);
+      status.ahead = Number(match?.[1] ?? 0);
+      status.behind = Number(match?.[2] ?? 0);
+    } else if (line.startsWith('# stash ')) {
+      status.stashed = Number(line.slice(8));
+    } else if (line.startsWith('? ')) {
+      status.untracked++;
+    } else if (line.startsWith('1 ') || line.startsWith('2 ')) {
+      const [index = '.', workingTree = '.'] = line.split(' ')[1] ?? '..';
+      if (index !== '.') status.staged++;
+      if (index === 'R' || workingTree === 'R') status.renamed++;
+      else if (index === 'D' || workingTree === 'D') status.deleted++;
+      else if (workingTree !== '.') status.modified++;
+    }
+  }
+
+  return status;
+};
+
+export default function (pi: ExtensionAPI) {
+  const detailed = process.env.SAGEVEIL_STATUSLINE === 'detailed';
+  let gitRoot: string | undefined;
+  let gitStatus = emptyGitStatus();
+  let requestRender: (() => void) | undefined;
+
+  const refreshGitStatus = async (cwd: string) => {
+    if (!gitRoot) return;
+    const result = await pi.exec(
+      'git',
+      ['status', '--porcelain=v2', '--branch', '--show-stash'],
+      { cwd, timeout: 1000 },
+    );
+    if (result.code !== 0) return;
+    const next = parseGitStatus(result.stdout);
+    if (JSON.stringify(next) === JSON.stringify(gitStatus)) return;
+    gitStatus = next;
+    requestRender?.();
+  };
+
+  pi.on('tool_execution_end', async (_event, ctx) => {
+    await refreshGitStatus(ctx.cwd);
+  });
+
+  pi.on('user_bash', (_event, ctx) => {
+    const local = createLocalBashOperations();
+    return {
+      operations: {
+        async exec(command, cwd, options) {
+          const result = await local.exec(command, cwd, options);
+          await refreshGitStatus(ctx.cwd);
+          return result;
+        },
+      },
+    };
+  });
+
+  pi.on('session_start', async (_event, ctx) => {
+    gitRoot = await pi
+      .exec('git', ['rev-parse', '--show-toplevel'], {
+        cwd: ctx.cwd,
+        timeout: 1000,
+      })
+      .then((result) => (result.code === 0 ? result.stdout.trim() : undefined))
+      .catch(() => undefined);
+    await refreshGitStatus(ctx.cwd);
+
+    ctx.ui.setFooter((tui, theme, footerData) => ({
+      dispose: footerData.onBranchChange(() => tui.requestRender()),
+      invalidate() {
+        // Colors are resolved on every render, so there is no cache to clear.
+      },
+      render(width: number): string[] {
+        requestRender = () => tui.requestRender();
+        const separator = theme.fg('border', '  ');
+        const branch = footerData.getGitBranch();
+        const statuses = Array.from(footerData.getExtensionStatuses().values());
+        const gitStatusText = [
+          gitStatus.untracked && theme.fg('dim', `?${gitStatus.untracked}`),
+          gitStatus.stashed && theme.fg('syntaxType', `$${gitStatus.stashed}`),
+          gitStatus.modified && theme.fg('warning', `!${gitStatus.modified}`),
+          gitStatus.renamed &&
+            theme.fg('syntaxOperator', `»${gitStatus.renamed}`),
+          gitStatus.deleted && theme.fg('error', `✘${gitStatus.deleted}`),
+          gitStatus.staged && theme.fg('success', `+${gitStatus.staged}`),
+          gitStatus.ahead && theme.fg('syntaxOperator', `⇡${gitStatus.ahead}`),
+          gitStatus.behind &&
+            theme.fg('customMessageLabel', `⇣${gitStatus.behind}`),
+        ]
+          .filter(Boolean)
+          .join(' ');
+        const left = [
+          piIcon,
+          theme.fg(
+            'accent',
+            `${gitRoot ? '󰊢' : '󰝰'} ${basename(gitRoot ?? ctx.cwd)}`,
+          ),
+          branch && theme.fg('customMessageLabel', ` ${branch}`),
+          gitStatusText,
+        ]
+          .filter(Boolean)
+          .join(separator);
+
+        const usage = ctx.getContextUsage();
+        const context = usage
+          ? `${usage.percent?.toFixed(1) ?? '?'}%/${formatTokens(usage.contextWindow)}`
+          : '?%/?';
+        const model = ctx.model?.id ?? 'no model';
+        const right = [
+          (detailed || (usage?.percent ?? 0) > 75) &&
+            theme.fg('muted', context),
+          theme.fg(
+            'dim',
+            ctx.model?.reasoning
+              ? `${model} • ${pi.getThinkingLevel()}`
+              : model,
+          ),
+        ]
+          .filter(Boolean)
+          .join(separator);
+
+        let detailLine = '';
+        if (detailed) {
+          let input = 0;
+          let output = 0;
+          let cacheRead = 0;
+          let cacheWrite = 0;
+          let cost = 0;
+          let cacheHitRate: number | undefined;
+
+          for (const entry of ctx.sessionManager.getEntries()) {
+            if (entry.type !== 'message' || entry.message.role !== 'assistant')
+              continue;
+            const usage = entry.message.usage;
+            input += usage.input;
+            output += usage.output;
+            cacheRead += usage.cacheRead;
+            cacheWrite += usage.cacheWrite;
+            cost += usage.cost.total;
+            const promptTokens =
+              usage.input + usage.cacheRead + usage.cacheWrite;
+            cacheHitRate = promptTokens
+              ? (usage.cacheRead / promptTokens) * 100
+              : undefined;
+          }
+
+          detailLine = theme.fg(
+            'dim',
+            [
+              input && `↑${formatTokens(input)}`,
+              output && `↓${formatTokens(output)}`,
+              cacheRead && `R${formatTokens(cacheRead)}`,
+              cacheWrite && `W${formatTokens(cacheWrite)}`,
+              cacheHitRate !== undefined && `CH${cacheHitRate.toFixed(1)}%`,
+              cost && `$${cost.toFixed(3)}`,
+            ]
+              .filter(Boolean)
+              .join(' '),
+          );
+        }
+
+        detailLine = truncateToWidth(detailLine, width);
+        const statusLine = truncateToWidth(statuses.join(separator), width);
+
+        if (visibleWidth(right) >= width) {
+          return [truncateToWidth(right, width), detailLine, statusLine].filter(
+            Boolean,
+          );
+        }
+
+        const shortLeft = truncateToWidth(
+          left,
+          width - visibleWidth(right) - 1,
+          '…',
+        );
+        const padding = ' '.repeat(
+          width - visibleWidth(shortLeft) - visibleWidth(right),
+        );
+        return [shortLeft + padding + right, detailLine, statusLine].filter(
+          Boolean,
+        );
+      },
+    }));
+  });
+}

@@ -1,7 +1,7 @@
 {
   "name": "@sageveil/pi",
-  "version": "0.2.1",
-  "description": "Sageveil TUI theme for Pi Coding Agent.",
+  "version": "0.2.2",
+  "description": "Sageveil TUI theme and statusline for Pi Coding Agent.",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -18,10 +18,18 @@
   },
   "homepage": "https://github.com/sageveil/pi",
   "files": [
+    "extensions/sageveil-statusline.ts",
     "themes/sageveil.json",
     "README.md"
   ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
   "pi": {
+    "extensions": [
+      "./extensions"
+    ],
     "themes": [
       "./themes"
     ]
