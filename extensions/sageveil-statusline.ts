@@ -4,11 +4,14 @@ import {
   type ExtensionAPI,
 } from '@earendil-works/pi-coding-agent';
 import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { sageveil } from '@sageveil/palette';
 import { readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
+const ansi = (hex: string) =>
+  hex.slice(1).match(/../g)!.map((part) => Number.parseInt(part, 16)).join(';');
 const piIcon =
-  '\x1b[38;2;16;19;16;48;2;135;111;127m π \x1b[49;38;2;135;111;127m\x1b[39m';
+  `\x1b[38;2;${ansi(sageveil.ansi.base.black)};48;2;${ansi(sageveil.ansi.base.magenta)}m π \x1b[49;38;2;${ansi(sageveil.ansi.base.magenta)}m\x1b[39m`;
 const formatTokens = (tokens: number) => {
   if (tokens < 1000) return tokens.toString();
   if (tokens < 10_000) return `${(tokens / 1000).toFixed(1)}k`;
